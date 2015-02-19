@@ -123,7 +123,6 @@ class MysqlCopyWriter implements CopyWriter {
 		try {
 			$res = $this->stmt->execute(array_values($values));
 		} catch (PDOException $e) {
-			var_dump($values);
 			$this->logger->fatal(sprintf("Cannot execute insert statement into table %s: %s", $this->tableName, $e->getMessage()));
 			return FALSE;
 		}
@@ -144,6 +143,7 @@ class MysqlCopyWriter implements CopyWriter {
 			if ($type == 'date') {
 				$value = date('Y-m-d', strtotime($val));
 			}
+			// TODO: Convert int(*) and float/double too?
 
 			$res[$key] = $value;
 		}
@@ -239,7 +239,7 @@ class MysqlCopyWriterAtomic implements CopyWriter {
 	}
 }
 
-class OciCopyReader {
+class OciReader {
 	public function __construct(SimpleLogger $logger, $user, $pass, $service) {
 		$this->logger = $logger;
 		$this->conn = oci_connect($user, $pass, $service);
@@ -375,7 +375,7 @@ function main() {
 	$r = $conf->getReader();
 
 	$mysqlConn = new MysqlConnection($logger, $w['user'], $w['password'], $w['host'], $w['database']);
-	$reader = new OciCopyReader($logger, $r['user'], $r['password'], $r['service']);
+	$reader = new OciReader($logger, $r['user'], $r['password'], $r['service']);
 	$writer = new MysqlCopyWriterAtomic($logger, $mysqlConn->get());
 
 	$tables = $conf->getTables();
@@ -388,16 +388,17 @@ function main() {
 		}
 
 		$res = $reader->copyTableInto($table, $writer);
-
 		if ($res === FALSE) {
 			$writer->discardCopy();
 			continue;
-		} else {
-			if (!$writer->closeTable()) {
-				continue;
-			}
-			$logger->log('info', sprintf('Copy of table %s finished', $table));
 		}
+
+		if (!$writer->closeTable()) {
+			// Continue if a importing into one table failed.
+			continue;
+		}
+		
+		$logger->log('info', sprintf('Copy of table %s finished', $table));
 	}
 
 	$reader->close();
