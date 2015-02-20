@@ -115,10 +115,10 @@ class MysqlWriter implements Writer {
 					continue;
 				}
 
-				$split = explode(', ', $k, 2);
+				$split = explode('->', $k, 2);
 
 				if (count($split) > 1) {
-					$k = $split[0];
+					$k = trim($split[0]);
 				}
 
 				$this->flippedFields[$k] = $v;
@@ -187,10 +187,10 @@ class MysqlWriter implements Writer {
 				if (strpos($this->config[$key], 'SQL:') === 0) {
 					$values[] = substr($this->config[$key], 4);
 				} else {
-					$split = explode(', ', $this->config[$key], 2);
+					$split = explode('->', $this->config[$key], 2);
 
 					if (count($split) > 1 && strlen($split[1]) > 0) {
-						$values[] = $split[1];
+						$values[] = trim($split[1]);
 					} else {
 						$values[] = '?';
 					}
@@ -262,7 +262,7 @@ class MysqlWriter implements Writer {
 
 		switch ($type) {
 		case 'date':
-			$value = date('Y-m-d', strtotime($val));
+			$value = date('d-m-Y', strtotime($val));
 			break;
 		default:
 			// Avoid null values. XXX: Do this only on NOT NULL?
@@ -490,11 +490,17 @@ class OciReader {
 }
 
 class Configuration {
-	public function __construct($filename) {
-		$this->conf = parse_ini_file($filename, TRUE);
-		if ($this->conf === FALSE) {
+	public function __construct() {
+		$this->conf = array();
+	}
+
+	public function load($filename) {
+		$conf = parse_ini_file($filename, TRUE);
+		if ($conf === FALSE) {
 			die('Cannot parse given .ini configuration');
 		}
+
+		$this->conf = array_merge_recursive($this->conf, $conf);
 	}
 
 	public function getWriter() {
@@ -568,20 +574,61 @@ class Configuration {
 	}
 }
 
+function usage() {
+	die("Usage: php-oci-import.php <ini-file...> [<log-file>]\n");
+}
+
+function loadConfiguration(array $argv, Configuration $conf) {
+	$logfile = '';
+
+	for ($i = 1; $i < count($argv); $i++) {
+		if (substr($argv[$i], -4) === '.ini') {
+			$conf->load($argv[$i]);
+		} else {
+			// Logfile set twice.
+			if ($logfile !== '') {
+				usage();
+			}
+
+			$logfile = $argv[$i];
+		}
+	}
+
+	return $logfile;
+}
+
+function copyTable($fromTable, $toTable, OciReader $reader, MysqlWriterAtomic $writer, Configuration $conf) {
+	if (!$writer->openTable($toTable, $conf->getTable($toTable))) {
+		return FALSE;
+	}
+
+	$res = $reader->copyTableInto($fromTable, $writer);
+	if ($res === FALSE) {
+		$writer->discardCopy();
+		return FALSE;
+	}
+
+	// XXX: Race condition between restoreKeptData and closeTable.
+
+	$res = $writer->restoreKeptData($conf->getTableClass($toTable, 'keep'));
+	if ($res === FALSE) {
+		$writer->discardCopy();
+		return FALSE;
+	}
+
+	if (!$writer->closeTable()) {
+		// Continue if importing into one table failed.
+		return FALSE;
+	}
+
+	return TRUE;
+}
+
 function main() {
 	global $argv;
 
-	if (count($argv) < 2) {
-		die("Usage: php-oci-import.php <ini-file> [<log-file>]\n");
-	}
-	
-	$conf = new Configuration($argv[1]);
-	$logfile = '';
-
-	if (isset($argv[2])) {
-		$logfile = $argv[2];
-	}
-
+	$conf = new Configuration();
+	$logfile = loadConfiguration($argv, $conf);
 	$logger = new SimpleLogger($logfile);
 
 	$w = $conf->getWriter();
@@ -594,34 +641,13 @@ function main() {
 	$tables = $conf->getTables();
 
 	foreach ($tables as $fromTable => $toTable) {
-		$logger->log('info', sprintf('Starting copy of table %s into %s', $fromTable, $toTable));
+		$logger->log('info', sprintf('Starting import of table %s into %s', $fromTable, $toTable));
 
-		if (!$writer->openTable($toTable, $conf->getTable($toTable))) {
-			return FALSE;
+		if (copyTable($fromTable, $toTable, $reader, $writer, $conf)) {
+			$logger->log('info', sprintf('Import of table %s into %s finished', $fromTable, $toTable));
+		} else {
+			$logger->log('info', sprintf('Import of table %s into %s failed', $fromTable, $toTable));
 		}
-
-		$res = $reader->copyTableInto($fromTable, $writer);
-		if ($res === FALSE) {
-			$writer->discardCopy();
-			continue;
-		}
-
-		// XXX: Race condition between restoreKeptData and closeTable.
-
-		$res = $writer->restoreKeptData($conf->getTableClass($toTable, 'keep'));
-		if ($res === FALSE) {
-			$writer->unlock();
-			$writer->discardCopy();
-			continue;
-		}
-
-		if (!$writer->closeTable()) {
-			$writer->unlock();
-			// Continue if a importing into one table failed.
-			continue;
-		}
-
-		$logger->log('info', sprintf('Copy of table %s into %s finished', $fromTable, $toTable));
 	}
 
 	$reader->close();
