@@ -21,8 +21,8 @@ class SimpleLogger {
 	}
 }
 
-interface CopyWriter {
-	public function openTable($table);
+interface Writer {
+	public function openTable($table, $config);
 	public function writeRow(array $row);
 	public function closeTable();
 	public function discardCopy();
@@ -45,7 +45,7 @@ class MysqlConnection {
 	}
 }
 
-class MysqlCopyWriter implements CopyWriter {
+class MysqlWriter implements Writer {
 	public function __construct(SimpleLogger $logger, PDO $conn) {
 		$this->conn = $conn;
 		$this->stmt = FALSE;
@@ -59,8 +59,9 @@ class MysqlCopyWriter implements CopyWriter {
 		}
 	}
 
-	public function openTable($tableName) {
+	public function openTable($tableName, $config) {
 		$this->tableName = $tableName;
+		$this->config = $config;
 		return $this->_loadTableFields();
 	}
 
@@ -82,6 +83,16 @@ class MysqlCopyWriter implements CopyWriter {
 		return FALSE;
 	}
 
+	public function query($sql, $error) {
+        try {
+            $this->conn->query($sql);
+        } catch (PDOException $e) {
+            $this->logger->log('error', $error . $e->getMessage());
+            return FALSE;
+        }
+        return TRUE;
+    }	
+
 	protected function _loadTableFields() {
 		$stmt = $this->conn->prepare(sprintf('DESCRIBE %s', $this->tableName));
 
@@ -92,18 +103,110 @@ class MysqlCopyWriter implements CopyWriter {
 			return FALSE;
 		}
 		$fields = $stmt->fetchAll(PDO::FETCH_ASSOC);
-		
+
+		$this->flippedFields = array();
+
+		if (count($this->config) > 0) {
+			// Here SQL: values might override each other. But we won't use them...
+			$flippedFields = array_flip($this->config);
+
+			foreach ($flippedFields as $k => $v) {
+				if (substr($k, 0, 3) === 'SQL:') {
+					continue;
+				}
+
+				$split = explode(', ', $k, 2);
+
+				if (count($split) > 1) {
+					$k = $split[0];
+				}
+
+				$this->flippedFields[$k] = $v;
+			}
+
+		} else {
+			foreach ($fields as $field) {
+				$this->flippedFields[$field['Field']] = $field['Field'];
+			}
+		}
+
+		$this->fields = array();
+
 		foreach ($fields as $field) {
-			$this->fields[$field['Field']] = $field['Type'];
+			$key = $field['Field'];
+
+			if (array_key_exists($key, $this->config)) {
+				$this->fields[$key] = $field['Type'];
+			}
 		}
 
 		return TRUE;
 	}
 
+	protected function _getMappedKey($key, $flippedConfig) {
+		foreach ($flippedConfig as $name => $val) {
+			if ($key === $name || substr($name, 0, strlen($key)+2) === ($key.', ')) {
+				return $val;
+			}
+		}
+
+		return FALSE;
+	}
+
+	protected function _getMappedKeys(array $keys) {
+		if (count($this->config) == 0) {
+			return $keys;
+		}
+
+		$result = array();
+
+		foreach ($this->config as $key => $val) {
+			if (strpos($val, 'SQL:') === 0) {
+				$result[] = $key;
+			}
+		}
+
+		$flippedConfig = array_flip($this->config);
+
+		foreach ($keys as $key) {
+			$val = $this->_getMappedKey($key, $flippedConfig);
+			if ($val !== FALSE) {
+				$result[] = $val;
+			}
+		}
+
+		return $result;
+	}
+
+	protected function _getMappedValues(array $keys) {
+		$values = array();
+
+		foreach ($keys as $key) {
+			// Only include mapped fields.
+			if (array_key_exists($key, $this->config)) {
+				if (strpos($this->config[$key], 'SQL:') === 0) {
+					$values[] = substr($this->config[$key], 4);
+				} else {
+					$split = explode(', ', $this->config[$key], 2);
+
+					if (count($split) > 1 && strlen($split[1]) > 0) {
+						$values[] = $split[1];
+					} else {
+						$values[] = '?';
+					}
+				}
+			}	
+		}
+
+		return $values;
+	}
+
 	protected function _prepareStmt(array $keys) {
-		$markers = rtrim(rtrim(str_repeat('?, ', count($keys)), ' '), ',');
-		$values = implode(', ', $keys);
-		$stmt = sprintf('INSERT INTO %s (%s) VALUES (%s)', $this->tableName, $values, $markers);
+		$this->mappedKeys = $this->_getMappedKeys($keys);
+
+		$names = implode(', ', $this->mappedKeys);
+		$values = implode(', ', $this->_getMappedValues($this->mappedKeys));
+		$stmt = sprintf('INSERT INTO %s (%s) VALUES (%s)', $this->tableName, $names, $values);
 
 		try {
 			$this->stmt = $this->conn->prepare($stmt);
@@ -114,8 +217,28 @@ class MysqlCopyWriter implements CopyWriter {
 		return TRUE;
 	}
 
+	protected function _getSortedValues($values) {
+		$result = array();
+
+		foreach ($values as $oldName => $val) {
+			if (array_key_exists($oldName, $this->flippedFields)) {
+				$result[$this->flippedFields[$oldName]] = $val;
+			}
+		}
+
+		$finalValues = array();
+
+		foreach ($this->mappedKeys as $key) {
+			if (array_key_exists($key, $result)) {
+				$finalValues[] = $this->_formatValue($key, $result[$key]);
+			}
+		}
+
+		return $finalValues;
+	}
+
 	protected function _insert(array $row) {
-		$values = $this->_formatValues($row);
+		$values = $this->_getSortedValues($row);
 		if ($values === FALSE) {
 			return FALSE;
 		}
@@ -129,39 +252,45 @@ class MysqlCopyWriter implements CopyWriter {
 		return TRUE;
 	}
 
-	protected function _formatValues(array $row) {
-		$res = array();
-
-		foreach ($row as $key => $val) {
-			if (!isset($this->fields[$key])) {
-				$this->logger->fatal(sprintf("Field %s does not seem to be set in MySQL destination DB (table %s).", $key, $this->tableName));
-				return FALSE;
-			}
-			$type = $this->fields[$key];
-			$value = $val;
-
-			if ($type == 'date') {
-				$value = date('Y-m-d', strtotime($val));
-			}
-			// TODO: Convert int(*) and float/double too?
-
-			$res[$key] = $value;
+	protected function _formatValue($key, $val) {
+		if (!array_key_exists($key, $this->fields)) {
+			$this->logger->fatal(sprintf("Field %s does not seem to be set in MySQL destination DB (table %s).", $key, $this->tableName));
+			return FALSE;
 		}
-		
-		return $res;
+		$type = $this->fields[$key];
+		$value = $val;
+
+		switch ($type) {
+		case 'date':
+			$value = date('Y-m-d', strtotime($val));
+			break;
+		default:
+			// Avoid null values. XXX: Do this only on NOT NULL?
+			if ($val === null) {
+				$value = '';
+			}
+		}
+		// TODO: Convert int(*) and float/double too?
+
+		return $value;
 	}
 }
 
-class MysqlCopyWriterAtomic implements CopyWriter {
+class MysqlWriterAtomic implements Writer {
 	public function __construct(SimpleLogger $logger, PDO $conn) {
 		$this->conn = $conn;
 		$this->logger = $logger;
-		$this->mysql = new MysqlCopyWriter($logger, $conn);
+		$this->mysql = new MysqlWriter($logger, $conn);
 	}
 
-	public function openTable($tableName) {
+	public function openTable($tableName, $config) {
 		$this->tableName = $tableName;
 		$this->tmpTable = $tableName . '_copy';
+
+		if (!$this->_tableExists($this->tableName)) {
+			$this->logger->fatal("Table {$this->tableName} doesn't exist.");
+			return FALSE;
+		}
 
 		if ($this->_tableExists($this->tmpTable)) {
 			$this->logger->fatal("Table {$this->tmpTable} already exists.");
@@ -174,7 +303,7 @@ class MysqlCopyWriterAtomic implements CopyWriter {
 			return FALSE;
 		}
 
-		return $this->mysql->openTable($this->tmpTable);
+		return $this->mysql->openTable($this->tmpTable, $config);
 	}
 
 	public function writeRow(array $row) {
@@ -211,7 +340,7 @@ class MysqlCopyWriterAtomic implements CopyWriter {
 
 	protected function _tableExists($tableName) {
 		try {
-			$this->conn->exec(sprintf("SELECT 1 FROM %s", $tableName));
+			$this->conn->query(sprintf("SELECT 1 FROM %s", $tableName));
 		} catch (PDOException $e) {
 			return FALSE;
 		}
@@ -219,23 +348,13 @@ class MysqlCopyWriterAtomic implements CopyWriter {
 	}
 
 	protected function _renameTable($from, $to) {
-		try {
-			$this->conn->exec(sprintf("RENAME TABLE %s TO %s", $from, $to));
-		} catch (PDOException $e) {
-			$this->logger->log('error', sprintf("Cannot rename table %s to %s: %s", $from, $to, $e->getMessage()));
-			return FALSE;
-		}
-		return TRUE;
+		return $this->mysql->query(sprintf("RENAME TABLE %s TO %s", $from, $to),
+			sprintf("Cannot rename table %s to %s: ", $from, $to));		
 	}
 
 	protected function _dropTable($tableName) {
-		try {
-			$this->conn->exec(sprintf('DROP TABLE %s', $tableName));
-		} catch (PDOException $e) {
-			$this->logger->log('error', sprintf("Cannot drop table %s: %s", $tableName, $e->getMessage()));
-			return FALSE;
-		}
-		return TRUE;
+		return $this->mysql->query(sprintf('DROP TABLE %s', $tableName),
+			sprintf("Cannot drop table %s: ", $tableName));		
 	}
 }
 
@@ -250,7 +369,7 @@ class OciReader {
 		}
 	}
 
-	public function copyTableInto($tableName, CopyWriter $dest) {
+	public function copyTableInto($tableName, Writer $dest) {
 		if (!$this->conn) {
 			$this->logger->fatal("Invalid Oracle reader connection");
 			return FALSE;
@@ -296,13 +415,13 @@ class Configuration {
 	}
 
 	public function getWriter() {
-		if (!isset($this->conf['writer'])) {
+		if (!array_key_exists('writer', $this->conf)) {
 			die('You must specify a writer section in config'."\n");
 		}
 		$w = $this->conf['writer'];
 		$type = 'mysql';
 
-		if (isset($w['type'])) {
+		if (array_key_exists('type', $w)) {
 			$type = $w['type'];
 		}
 
@@ -311,7 +430,7 @@ class Configuration {
 		}
 
 		foreach(array('user', 'password', 'host', 'database') as $key) {
-			if (!isset($w[$key])) {
+			if (!array_key_exists($key, $w)) {
 				die(sprintf("Please set required %s in writer section\n", $key));
 			}
 		}
@@ -320,14 +439,14 @@ class Configuration {
 	}
 
 	public function getReader() {
-		if (!isset($this->conf['reader'])) {
+		if (!array_key_exists('reader', $this->conf)) {
 			die('You must specify a reader section in config'."\n");
 		}
 		$r = $this->conf['reader'];
 		$type = 'oracle';
 
-		if (isset($w['type'])) {
-			$type = $w['type'];
+		if (array_key_exists('type', $r)) {
+			$type = $r['type'];
 		}
 
 		if ($type != 'oracle') {
@@ -335,7 +454,7 @@ class Configuration {
 		}
 	
 		foreach(array('user', 'password', 'service') as $key) {
-			if (!isset($r[$key])) {
+			if (!array_key_exists($key, $r)) {
 				die(sprintf("Please set required %s in reader section\n", $key));
 			}
 		}
@@ -344,15 +463,22 @@ class Configuration {
 	}
 
 	public function getTables() {
-		if (!isset($this->conf['tables'])) {
+		if (!array_key_exists('tables', $this->conf)) {
 			die('Please set required tables section in configuration'."\n");
 		}
 		if (!is_array($this->conf['tables'])) {
 			die('Tables list must be an array'."\n");
 		}
-		return array_values($this->conf['tables']);
+		return array_flip($this->conf['tables']);
 	}
 
+	public function getTable($tableName) {
+		if (!array_key_exists($tableName, $this->conf)) {
+			return array();
+		}
+
+		return $this->conf[$tableName];
+	}
 }
 
 function main() {
@@ -376,18 +502,18 @@ function main() {
 
 	$mysqlConn = new MysqlConnection($logger, $w['user'], $w['password'], $w['host'], $w['database']);
 	$reader = new OciReader($logger, $r['user'], $r['password'], $r['service']);
-	$writer = new MysqlCopyWriterAtomic($logger, $mysqlConn->get());
-
+	$writer = new MysqlWriterAtomic($logger, $mysqlConn->get());
+	
 	$tables = $conf->getTables();
 
-	foreach ($tables as $table) {
-		$logger->log('info', sprintf('Starting copy of table %s', $table));
+	foreach ($tables as $fromTable => $toTable) {
+		$logger->log('info', sprintf('Starting copy of table %s into %s', $fromTable, $toTable));
 
-		if (!$writer->openTable($table)) {
+		if (!$writer->openTable($toTable, $conf->getTable($toTable))) {
 			return FALSE;
 		}
 
-		$res = $reader->copyTableInto($table, $writer);
+		$res = $reader->copyTableInto($fromTable, $writer);
 		if ($res === FALSE) {
 			$writer->discardCopy();
 			continue;
@@ -398,7 +524,7 @@ function main() {
 			continue;
 		}
 		
-		$logger->log('info', sprintf('Copy of table %s finished', $table));
+		$logger->log('info', sprintf('Copy of table %s into %s finished', $fromTable, $toTable));
 	}
 
 	$reader->close();
