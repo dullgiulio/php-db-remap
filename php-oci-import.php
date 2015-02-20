@@ -338,6 +338,89 @@ class MysqlWriterAtomic implements Writer {
 		return $this->_dropTable($randName);
 	}
 
+	public function restoreKeptData($config) {
+		if (count($config) == 0) {
+			return TRUE;
+		}
+
+		$key = $config['key'];
+		$fields = $config['fields'];
+
+		if ($key == '' || count($fields) == 0) {
+			// TODO: Log a warning?
+			return TRUE;
+		}
+
+		$data = $this->_loadKeptData($this->tableName, $key, $fields);
+		if ($data === FALSE) {
+			return FALSE;
+		}
+	   
+		$res = $this->_updateKeptData($this->tmpTable, $key, $data);
+		
+		return $res;
+	}
+
+	protected function _getMarkerFields($updateKey, $data) {
+		$data = current($data);
+		$markers = array();
+
+		foreach ($data as $key => $val) {
+			if ($key !== $updateKey) {
+				$markers[] = sprintf("%s = ?", $key);
+			}
+		}
+
+		return implode(', ', $markers);
+	}
+
+	protected function _updateKeptData($tableName, $key, $data) {
+		$stmt = $this->conn->prepare(sprintf('UPDATE %s SET %s WHERE %s = ?',  $tableName, $this->_getMarkerFields($key, $data), $key));
+
+		foreach ($data as $whereKey => $values) {
+			$cleanValues = array();
+
+			foreach($values as $k => $val) {
+				if ($k !== $key) {
+					$cleanValues[] = $val;
+				}
+			}
+
+			$cleanValues[] = $values[$key];
+
+			try {
+				$stmt->execute($cleanValues);
+			} catch (PDOException $e) {
+				$this->logger->fatal(sprintf("Cannot update table %s: %s", $this->tableName, $e->getMessage()));
+				return FALSE;
+			}
+		}
+
+		return TRUE;
+	}
+
+	protected function _loadKeptData($tableName, $key, $fields) {
+		$data = array();
+
+		$stmt = $this->conn->prepare(sprintf('SELECT %s,%s FROM %s', $key, implode(', ', $fields), $tableName));
+
+        try {
+            $stmt->execute();
+        } catch (PDOException $e) {
+            $this->logger->fatal(sprintf("Cannot describe table %s: %s", $this->tableName, $e->getMessage()));
+            return FALSE;
+        }
+        $fields = $stmt->fetchAll(PDO::FETCH_ASSOC);
+		
+		foreach ($fields as $val) {
+			if (array_key_exists($key, $val)) {
+				$data[$val[$key]] = $val;
+			}
+		}
+
+		return $data;
+	}
+
 	protected function _tableExists($tableName) {
 		try {
 			$this->conn->query(sprintf("SELECT 1 FROM %s", $tableName));
@@ -479,6 +562,10 @@ class Configuration {
 
 		return $this->conf[$tableName];
 	}
+
+	public function getTableClass($tableName, $class) {
+		return $this->getTable(sprintf('%s:%s', $tableName, $class));
+	}
 }
 
 function main() {
@@ -519,11 +606,21 @@ function main() {
 			continue;
 		}
 
+		// XXX: Race condition between restoreKeptData and closeTable.
+
+		$res = $writer->restoreKeptData($conf->getTableClass($toTable, 'keep'));
+		if ($res === FALSE) {
+			$writer->unlock();
+			$writer->discardCopy();
+			continue;
+		}
+
 		if (!$writer->closeTable()) {
+			$writer->unlock();
 			// Continue if a importing into one table failed.
 			continue;
 		}
-		
+
 		$logger->log('info', sprintf('Copy of table %s into %s finished', $fromTable, $toTable));
 	}
 
