@@ -1,6 +1,4 @@
 TODO
 ====
 
-* Execute arbirary after closing a table (recreate indices etc).
-* Support paginated imports?
 * Try to find a solution to the race problem.
