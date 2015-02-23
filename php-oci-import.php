@@ -281,6 +281,7 @@ class PDOWriterAtomic implements Writer {
 		$this->conn = $conn->get();
 		$this->logger = $logger;
 		$this->writer = new PDOWriter($logger, $conn);
+		$this->keptConf = array();
 	}
 
 	public function openTable($tableName, $config) {
@@ -315,30 +316,42 @@ class PDOWriterAtomic implements Writer {
 	}
 
 	public function closeTable() {
-		if (!$this->writer->closeTable()) {
-			return FALSE;
-		}
-	
-		$randName = sprintf("%s_%04d", $this->tmpTable, rand(0, 1000));
-		if (!$this->_renameTable($this->tableName, $randName)) {
-			$this->_dropTable($this->tmpTable);
-			$this->logger->fatal("Cannot rename table to temporary name");
-			return FALSE;
-		}
+		$this->_openTransaction();
 
-		if (!$this->_renameTable($this->tmpTable, $this->tableName)) {
-			if (!$this->_renameTable($randName, $this->tableName)) {
-				$this->logger->log('error', "Couldn't rename temporary named old data table into real table");
+		if (count($this->keptConf) > 1) {
+			if (!$this->_restoreKeptData($this->keptConf)) {
+				$this->_cancelTransaction();
+				return FALSE;
 			}
-			$this->_dropTable($this->tmpTable);
-			$this->logger->fatal("Failed to rename table to real name");
+		}
+		
+		if (!$this->writer->closeTable()) {
+			$this->_cancelTransaction();
 			return FALSE;
 		}
 
-		return $this->_dropTable($randName);
+		try {
+			$this->conn->query(sprintf('TRUNCATE %s', $this->tableName));
+			$this->conn->query(sprintf('INSERT INTO %s SELECT * FROM %s', $this->tableName, $this->tmpTable));
+		} catch (PDOException $e) {
+			$this->_cancelTransaction();
+			$this->logger->log('error', sprintf("Couldn't commit transaction to update table %s: %s", $this->tableName, $e->getMessage()));
+			$this->_dropTable($this->tmpTable);
+			return FALSE;
+		}
+
+		$this->_closeTransaction();
+
+		$res = $this->_dropTable($this->tmpTable);
+		$this->conn->query(sprintf('OPTIMIZE TABLE %s', $this->tableName));
+		return $res;
 	}
 
-	public function restoreKeptData($config) {
+	public function setKeptData($config) {
+		$this->keptConf = $config;
+	}
+
+	protected function _restoreKeptData($config) {
 		if (count($config) == 0) {
 			return TRUE;
 		}
@@ -347,7 +360,6 @@ class PDOWriterAtomic implements Writer {
 		$fields = $config['fields'];
 
 		if ($key == '' || count($fields) == 0) {
-			// TODO: Log a warning?
 			return TRUE;
 		}
 
@@ -356,9 +368,41 @@ class PDOWriterAtomic implements Writer {
 			return FALSE;
 		}
 	   
-		$res = $this->_updateKeptData($this->tmpTable, $key, $data);
-		
-		return $res;
+		return $this->_updateKeptData($this->tmpTable, $key, $data);
+	}
+
+	protected function _openTransaction() {
+		try {
+			$this->conn->beginTransaction();
+		} catch (PDOException $e) {
+			$this->logger->log('error', sprintf('Cannot start transaction: %s', $e->getMessage()));
+			return FALSE;
+		}
+
+		return TRUE;
+	}
+
+	protected function _closeTransaction() {
+		try {
+			$this->conn->commit();
+		} catch (PDOException $e) {
+			$this->logger->log('error', sprintf('Cannot commit transaction: %s', $e->getMessage()));
+			$this->_cancelTransaction();
+			return FALSE;
+		}
+
+		return TRUE;
+	}
+
+	protected function _cancelTransaction() {
+		try {
+			$this->conn->rollBack();
+		} catch (PDOException $e) {
+			$this->logger->fatal(sprintf('Cannot rollback transaction: %s', $e->getMessage()));
+			return FALSE;
+		}
+
+		return TRUE;
 	}
 
 	protected function _getMarkerFields($updateKey, $data) {
@@ -402,12 +446,12 @@ class PDOWriterAtomic implements Writer {
 	protected function _loadKeptData($tableName, $key, $fields) {
 		$data = array();
 
-		$stmt = $this->conn->prepare(sprintf('SELECT %s,%s FROM %s', $key, implode(', ', $fields), $tableName));
+		$stmt = $this->conn->prepare(sprintf('SELECT %s,%s FROM %s LOCK IN SHARE MODE', $key, implode(', ', $fields), $tableName));
 
         try {
             $stmt->execute();
         } catch (PDOException $e) {
-            $this->logger->fatal(sprintf("Cannot describe table %s: %s", $this->tableName, $e->getMessage()));
+            $this->logger->fatal(sprintf("Cannot get kept data from table %s: %s", $this->tableName, $e->getMessage()));
             return FALSE;
         }
         $fields = $stmt->fetchAll(PDO::FETCH_ASSOC);
@@ -578,15 +622,10 @@ function copyTable($fromTable, $toTable, PDOReader $reader, PDOWriterAtomic $wri
 		return FALSE;
 	}
 
-	// XXX: Race condition between restoreKeptData and closeTable.
-
-	$res = $writer->restoreKeptData($conf->getTableClass($toTable, 'keep'));
-	if ($res === FALSE) {
-		$writer->discardCopy();
-		return FALSE;
-	}
+	$writer->setKeptData($conf->getTableClass($toTable, 'keep'));
 
 	if (!$writer->closeTable()) {
+		$writer->discardCopy();
 		// Continue if importing into one table failed.
 		return FALSE;
 	}
