@@ -28,10 +28,10 @@ interface Writer {
 	public function discardCopy();
 }
 
-class MysqlConnection {
-	public function __construct(SimpleLogger $logger, $user, $pass, $host, $db) {
+class PDOConnection {
+	public function __construct(SimpleLogger $logger, $dsn, $user, $pass) {
         try {
-            $this->conn = new PDO(sprintf('mysql:host=%s;dbname=%s', $host, $db), $user, $pass);
+            $this->conn = new PDO($dsn, $user, $pass);
         } catch (PDOException $e) {
 			$logger->fatal($e->getMessage());
 			exit;
@@ -441,51 +441,44 @@ class MysqlWriterAtomic implements Writer {
 	}
 }
 
-class OciReader {
-	public function __construct(SimpleLogger $logger, $user, $pass, $service) {
+class PDOReader {
+	public function __construct(SimpleLogger $logger, $conn) {
 		$this->logger = $logger;
-		$this->conn = oci_connect($user, $pass, $service);
-		if (!$this->conn) {
-    		$e = oci_error();
-			$this->logger->fatal($e['message']);
-			exit;
-		}
+		$this->conn = $conn;
 	}
 
 	public function copyTableInto($tableName, Writer $dest) {
 		if (!$this->conn) {
-			$this->logger->fatal("Invalid Oracle reader connection");
+			$this->logger->fatal('Invalid PDO reader connection');
+			return FALSE;
+		}
+
+		try {
+			$stmt = $this->conn->query(sprintf('SELECT * FROM %s', $tableName));
+		} catch (PDOException $e) {
+			$this->logger->fatal(sprintf("Cannot select all from table %s: %s", $this->tableName, $e->getMessage()));
 			return FALSE;
 		}
 		
-		$stid = oci_parse($this->conn, sprintf('SELECT * FROM %s', $tableName));
-		if (!$stid) {
-			$e = oci_error($this->conn);
-			$this->logger->fatal($e['message']);
-			return FALSE;
-		}
+		do {
+			$row = $stmt->fetch(PDO::FETCH_ASSOC);
 
-		$r = oci_execute($stid);
-		if (!$r) {
-			$e = oci_error($stid);
-			$this->logger->fatal($e['message']);
-			return FALSE;
-		}
+			if ($row === FALSE) {
+				break;
+			}
 
-		while ($row = oci_fetch_array($stid, OCI_ASSOC+OCI_RETURN_NULLS)) {
 			if (!$dest->writeRow($row)) {
-				$this->logger->fatal("Error while copying. Copying halted");
-				oci_free_statement($stid);
+				$this->logger->fatal('Error while copying. Copying halted');
+				$stmt->closeCursor();
 				return FALSE;
 			}
-		}
-
-		oci_free_statement($stid);
+		} while (TRUE);
+		
 		return TRUE;
 	}
 
 	public function close() {
-		oci_close($this->conn);
+		return TRUE;
 	}
 }
 
@@ -508,17 +501,8 @@ class Configuration {
 			die('You must specify a writer section in config'."\n");
 		}
 		$w = $this->conf['writer'];
-		$type = 'mysql';
 
-		if (array_key_exists('type', $w)) {
-			$type = $w['type'];
-		}
-
-		if ($type != 'mysql') {
-			die('Only allowed writer type is Mysql'."\n");
-		}
-
-		foreach(array('user', 'password', 'host', 'database') as $key) {
+		foreach(array('user', 'password', 'dsn') as $key) {
 			if (!array_key_exists($key, $w)) {
 				die(sprintf("Please set required %s in writer section\n", $key));
 			}
@@ -532,17 +516,8 @@ class Configuration {
 			die('You must specify a reader section in config'."\n");
 		}
 		$r = $this->conf['reader'];
-		$type = 'oracle';
-
-		if (array_key_exists('type', $r)) {
-			$type = $r['type'];
-		}
-
-		if ($type != 'oracle') {
-			die('Only supported reader is Oracle'."\n");
-		}
 	
-		foreach(array('user', 'password', 'service') as $key) {
+		foreach(array('user', 'password', 'dsn') as $key) {
 			if (!array_key_exists($key, $r)) {
 				die(sprintf("Please set required %s in reader section\n", $key));
 			}
@@ -597,7 +572,7 @@ function loadConfiguration(array $argv, Configuration $conf) {
 	return $logfile;
 }
 
-function copyTable($fromTable, $toTable, OciReader $reader, MysqlWriterAtomic $writer, Configuration $conf) {
+function copyTable($fromTable, $toTable, PDOReader $reader, MysqlWriterAtomic $writer, Configuration $conf) {
 	if (!$writer->openTable($toTable, $conf->getTable($toTable))) {
 		return FALSE;
 	}
@@ -634,8 +609,9 @@ function main() {
 	$w = $conf->getWriter();
 	$r = $conf->getReader();
 
-	$mysqlConn = new MysqlConnection($logger, $w['user'], $w['password'], $w['host'], $w['database']);
-	$reader = new OciReader($logger, $r['user'], $r['password'], $r['service']);
+	$mysqlConn = new PDOConnection($logger, $w['dsn'], $w['user'], $w['password']);
+	$oracleConn = new PDOConnection($logger, $r['dsn'], $r['user'], $r['password']);
+	$reader = new PDOReader($logger, $oracleConn->get());
 	$writer = new MysqlWriterAtomic($logger, $mysqlConn->get());
 	
 	$tables = $conf->getTables();
