@@ -45,7 +45,7 @@ class PDOConnection {
 	}
 }
 
-class MysqlWriter implements Writer {
+class PDOWriter implements Writer {
 	public function __construct(SimpleLogger $logger, PDOConnection $conn) {
 		$this->conn = $conn->get();
 		$this->stmt = FALSE;
@@ -276,11 +276,11 @@ class MysqlWriter implements Writer {
 	}
 }
 
-class MysqlWriterAtomic implements Writer {
+class PDOWriterAtomic implements Writer {
 	public function __construct(SimpleLogger $logger, PDOConnection $conn) {
 		$this->conn = $conn->get();
 		$this->logger = $logger;
-		$this->mysql = new MysqlWriter($logger, $conn);
+		$this->writer = new PDOWriter($logger, $conn);
 	}
 
 	public function openTable($tableName, $config) {
@@ -303,11 +303,11 @@ class MysqlWriterAtomic implements Writer {
 			return FALSE;
 		}
 
-		return $this->mysql->openTable($this->tmpTable, $config);
+		return $this->writer->openTable($this->tmpTable, $config);
 	}
 
 	public function writeRow(array $row) {
-		return $this->mysql->writeRow($row);
+		return $this->writer->writeRow($row);
 	}
 
 	public function discardCopy() {
@@ -315,7 +315,7 @@ class MysqlWriterAtomic implements Writer {
 	}
 
 	public function closeTable() {
-		if (!$this->mysql->closeTable()) {
+		if (!$this->writer->closeTable()) {
 			return FALSE;
 		}
 	
@@ -431,12 +431,12 @@ class MysqlWriterAtomic implements Writer {
 	}
 
 	protected function _renameTable($from, $to) {
-		return $this->mysql->query(sprintf("RENAME TABLE %s TO %s", $from, $to),
+		return $this->writer->query(sprintf("RENAME TABLE %s TO %s", $from, $to),
 			sprintf("Cannot rename table %s to %s: ", $from, $to));		
 	}
 
 	protected function _dropTable($tableName) {
-		return $this->mysql->query(sprintf('DROP TABLE %s', $tableName),
+		return $this->writer->query(sprintf('DROP TABLE %s', $tableName),
 			sprintf("Cannot drop table %s: ", $tableName));		
 	}
 }
@@ -567,7 +567,7 @@ function loadConfiguration(array $argv, Configuration $conf) {
 	return $logfile;
 }
 
-function copyTable($fromTable, $toTable, PDOReader $reader, MysqlWriterAtomic $writer, Configuration $conf) {
+function copyTable($fromTable, $toTable, PDOReader $reader, PDOWriterAtomic $writer, Configuration $conf) {
 	if (!$writer->openTable($toTable, $conf->getTable($toTable))) {
 		return FALSE;
 	}
@@ -608,7 +608,7 @@ function main() {
 	$writerConn = new PDOConnection($logger, $w['dsn'], $w['user'], $w['password']);
 	
 	$reader = new PDOReader($logger, $readerConn);
-	$writer = new MysqlWriterAtomic($logger, $writerConn);
+	$writer = new PDOWriterAtomic($logger, $writerConn);
 
 	$tables = $conf->getTables();
 
