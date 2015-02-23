@@ -46,8 +46,8 @@ class PDOConnection {
 }
 
 class MysqlWriter implements Writer {
-	public function __construct(SimpleLogger $logger, PDO $conn) {
-		$this->conn = $conn;
+	public function __construct(SimpleLogger $logger, PDOConnection $conn) {
+		$this->conn = $conn->get();
 		$this->stmt = FALSE;
 		$this->logger = $logger;
 
@@ -277,8 +277,8 @@ class MysqlWriter implements Writer {
 }
 
 class MysqlWriterAtomic implements Writer {
-	public function __construct(SimpleLogger $logger, PDO $conn) {
-		$this->conn = $conn;
+	public function __construct(SimpleLogger $logger, PDOConnection $conn) {
+		$this->conn = $conn->get();
 		$this->logger = $logger;
 		$this->mysql = new MysqlWriter($logger, $conn);
 	}
@@ -442,17 +442,12 @@ class MysqlWriterAtomic implements Writer {
 }
 
 class PDOReader {
-	public function __construct(SimpleLogger $logger, $conn) {
+	public function __construct(SimpleLogger $logger, PDOConnection $conn) {
 		$this->logger = $logger;
-		$this->conn = $conn;
+		$this->conn = $conn->get();
 	}
 
 	public function copyTableInto($tableName, Writer $dest) {
-		if (!$this->conn) {
-			$this->logger->fatal('Invalid PDO reader connection');
-			return FALSE;
-		}
-
 		try {
 			$stmt = $this->conn->query(sprintf('SELECT * FROM %s', $tableName));
 		} catch (PDOException $e) {
@@ -609,11 +604,12 @@ function main() {
 	$w = $conf->getWriter();
 	$r = $conf->getReader();
 
-	$mysqlConn = new PDOConnection($logger, $w['dsn'], $w['user'], $w['password']);
-	$oracleConn = new PDOConnection($logger, $r['dsn'], $r['user'], $r['password']);
-	$reader = new PDOReader($logger, $oracleConn->get());
-	$writer = new MysqlWriterAtomic($logger, $mysqlConn->get());
+	$readerConn = new PDOConnection($logger, $r['dsn'], $r['user'], $r['password']);
+	$writerConn = new PDOConnection($logger, $w['dsn'], $w['user'], $w['password']);
 	
+	$reader = new PDOReader($logger, $readerConn);
+	$writer = new MysqlWriterAtomic($logger, $writerConn);
+
 	$tables = $conf->getTables();
 
 	foreach ($tables as $fromTable => $toTable) {
