@@ -28,6 +28,12 @@ interface Writer {
 	public function discardCopy();
 }
 
+interface ValueProvider {
+	public function init(SimpleLogger $logger, PDOConnection $pdo);
+	public function getMarker();
+	public function getValue($key, $row);
+}
+
 class PDOConnection {
 	public function __construct(SimpleLogger $logger, $dsn, $user, $pass) {
         try {
@@ -45,6 +51,70 @@ class PDOConnection {
 	}
 }
 
+class SQLValueProvider implements ValueProvider {
+	public function init(SimpleLogger $logger, PDOConnection $pdo) {
+		$this->logger = $logger;
+		$this->conn = $pdo->get();
+	}
+	
+	public function getMarker() {
+		return $this->marker;
+	}
+
+
+}
+
+class StableValueProvider implements ValueProvider {
+	public function __construct($originalTable, $key, $stableKey) {
+		$this->targetTable = $targetTable;
+		$this->key = $key;
+		$this->stableKey = $stableKey;
+		$this->values = array();
+		$this->maxValue = 0;	
+
+		$this->_loadAll();
+	}
+
+	public function init(SimpleLogger $logger, PDOConnection $pdo) {
+		$this->conn = $pdo->get();
+		$this->logger = $logger;
+	}
+
+	public function getValue($stableValue) {
+		if (array_key_exists($stableValue, $this->values)) {
+			return $this->values[$stableValue];
+		} else {
+			$this->maxValue++;
+			return $this->maxValue;
+		}
+	}
+
+	protected function _loadAll() {
+		$stmt = $this->conn->prepare(sprintf('SELECT %s, %s FROM %s', $this->originalTable, $this->key, $this->stableKey));
+
+        try {
+            $stmt->execute();
+        } catch (PDOException $e) {
+            $this->logger->fatal(sprintf("Cannot fetch stable values on %s: %s", $this->originalTable, $e->getMessage()));
+            return FALSE;
+        }
+
+        $fields = $stmt->fetchAll(PDO::FETCH_ASSOC);
+	
+		foreach ($fields as $key => $val) {
+			$this->values[$val[$this->stableKey]] = $val[$this->key];
+			
+			$value = intval($val[$this->key]);
+			if ($value > $this->maxValue) {
+				$this->maxValue = $value;
+			}
+		}
+
+		var_dump($this->values);exit;
+		return TRUE;
+	}
+}
+
 class PDOWriter implements Writer {
 	public function __construct(SimpleLogger $logger, PDOConnection $conn) {
 		$this->conn = $conn->get();
@@ -57,6 +127,10 @@ class PDOWriter implements Writer {
 			$this->logger->fatal("Cannot set NAMES to utf8 while opening MySQL database");
 			exit;
 		}
+	}
+
+	public function setStableTable($tableName) {
+		$this->stableTableName = $tableName;
 	}
 
 	public function openTable($tableName, $config) {
@@ -161,7 +235,7 @@ class PDOWriter implements Writer {
 		$result = array();
 
 		foreach ($this->config as $key => $val) {
-			if (strpos($val, 'SQL:') === 0) {
+			if (strpos($val, 'SQL:') === 0 || strpos($val, 'STABLE:')) {
 				$result[] = $key;
 			}
 		}
